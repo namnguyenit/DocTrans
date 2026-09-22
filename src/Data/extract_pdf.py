@@ -659,6 +659,66 @@ def order_layout_items(items, page_rect):
     return ordered
 
 
+def split_lines_into_paragraphs(lines, angle):
+    """Split lines of a text block into separate paragraphs based on:
+    1. Blank / empty lines.
+    2. Vertical spacing gaps between lines (gap > 0.40 * line_height).
+    3. Short ending lines with terminal punctuation followed by left-margin start.
+    """
+    if not lines or abs(angle) > 5:
+        return [lines] if lines else []
+
+    valid_lines = [l for l in lines if "".join(s.get("text", "") for s in l.get("spans", [])).strip()]
+    if not valid_lines:
+        return []
+
+    min_x0 = min(l["bbox"][0] for l in valid_lines)
+    max_x1 = max(l["bbox"][2] for l in valid_lines)
+    block_w = max_x1 - min_x0
+
+    paras = []
+    curr = []
+    prev_line = None
+
+    for l in lines:
+        txt = "".join(s.get("text", "") for s in l.get("spans", [])).strip()
+        if not txt:
+            if curr:
+                paras.append(curr)
+                curr = []
+            prev_line = None
+            continue
+
+        if prev_line is not None:
+            prev_txt = "".join(s.get("text", "") for s in prev_line.get("spans", [])).strip()
+            prev_y0, prev_y1 = prev_line["bbox"][1], prev_line["bbox"][3]
+            curr_y0, curr_y1 = l["bbox"][1], l["bbox"][3]
+            line_h = max(1.0, prev_y1 - prev_y0)
+            gap = curr_y0 - prev_y1
+            line_step = curr_y0 - prev_y0
+
+            is_gap = (gap > max(3.5, line_h * 0.40) or line_step > line_h * 1.40)
+
+            is_short_terminal = False
+            if prev_txt and prev_txt[-1] in ".!?:)\"\x27”’":
+                prev_w = prev_line["bbox"][2] - min_x0
+                right_gap = max_x1 - prev_line["bbox"][2]
+                if prev_w < block_w * 0.85 and right_gap >= 25.0 and l["bbox"][0] <= min_x0 + 20.0:
+                    is_short_terminal = True
+
+            if is_gap or is_short_terminal:
+                if curr:
+                    paras.append(curr)
+                    curr = []
+
+        curr.append(l)
+        prev_line = l
+
+    if curr:
+        paras.append(curr)
+    return paras
+
+
 def extract_pdf_pages(filepath, target_page=None, include_images=False, password=None):
     try:
         document = fitz.open(filepath)
@@ -695,6 +755,8 @@ def extract_pdf_pages(filepath, target_page=None, include_images=False, password
                 if b.get("type") != 0:
                     continue
                 lines = b.get("lines", [])
+                if not lines:
+                    continue
                 dir_v = lines[0].get("dir", (1.0, 0.0)) if lines else (1.0, 0.0)
                 dx, dy = dir_v
                 angle_deg = round(math.degrees(math.atan2(dy, dx)))
@@ -714,51 +776,71 @@ def extract_pdf_pages(filepath, target_page=None, include_images=False, password
                 else:
                     angle = angle_deg
 
-                text = dict_block_text(b).strip()
-                if not text:
-                    continue
+                # Split block into distinct paragraphs to preserve original PDF paragraph separation
+                para_groups = split_lines_into_paragraphs(lines, angle)
+                valid_block_lines = [l for l in lines if "".join(s.get("text", "") for s in l.get("spans", [])).strip()]
+                b_min_x0 = min(l["bbox"][0] for l in valid_block_lines) if valid_block_lines else b["bbox"][0]
+                b_max_x1 = max(l["bbox"][2] for l in valid_block_lines) if valid_block_lines else b["bbox"][2]
+                b_width = b_max_x1 - b_min_x0
 
-                spans = [s for l in lines for s in l.get("spans", []) if s.get("text", "").strip()]
-                avg_size = sum(s.get("size", 11.0) for s in spans) / max(1, len(spans))
-                is_bold = any((s.get("flags", 0) & 2) != 0 or "bold" in s.get("font", "").lower() for s in spans)
-                is_heading = is_bold and avg_size >= 12.5
+                for para_lines in para_groups:
+                    text = visual_block_text(para_lines).strip()
+                    if not text:
+                        continue
 
-                hex_color = "#111827"
-                if spans:
-                    c = spans[0].get("color", 0)
-                    if isinstance(c, int):
-                        r = (c >> 16) & 0xFF
-                        g = (c >> 8) & 0xFF
-                        b_col = c & 0xFF
-                        if r > 240 and g > 240 and b_col > 240:
-                            hex_color = "#FFFFFF"
-                        elif r > 10 or g > 10 or b_col > 10:
-                            hex_color = f"#{r:02X}{g:02X}{b_col:02X}"
+                    spans = [s for l in para_lines for s in l.get("spans", []) if s.get("text", "").strip()]
+                    avg_size = sum(s.get("size", 11.0) for s in spans) / max(1, len(spans))
+                    is_bold = any((s.get("flags", 0) & 2) != 0 or "bold" in s.get("font", "").lower() for s in spans)
+                    is_heading = is_bold and avg_size >= 12.5
 
-                bbox = [round(b["bbox"][0], 2), round(b["bbox"][1], 2), round(b["bbox"][2], 2), round(b["bbox"][3], 2)]
-                bw = bbox[2] - bbox[0]
-                bh = bbox[3] - bbox[1]
+                    hex_color = "#111827"
+                    if spans:
+                        c = spans[0].get("color", 0)
+                        if isinstance(c, int):
+                            r = (c >> 16) & 0xFF
+                            g = (c >> 8) & 0xFF
+                            b_col = c & 0xFF
+                            if r > 240 and g > 240 and b_col > 240:
+                                hex_color = "#FFFFFF"
+                            elif r > 10 or g > 10 or b_col > 10:
+                                hex_color = f"#{r:02X}{g:02X}{b_col:02X}"
 
-                # Watermark detection
-                is_diagonal = (abs(angle) > 10 and abs(angle) < 80) or (abs(angle) > 100 and abs(angle) < 170)
-                watermark_keywords = ("internal use", "confidential", "proprietary", "draft", "watermark", "sample", "strictly private", "hsptek", "do not distribute")
-                text_lower = text.lower()
-                is_watermark_text = any(kw in text_lower for kw in watermark_keywords)
-                is_huge_sparse = (bw > page.rect.width * 0.35 and bh > page.rect.height * 0.25 and (is_diagonal or len(text.split()) < 15))
-                is_watermark = is_diagonal or is_watermark_text or is_huge_sparse
+                    p_x0 = min(l["bbox"][0] for l in para_lines)
+                    p_y0 = min(l["bbox"][1] for l in para_lines)
+                    p_x1 = max(l["bbox"][2] for l in para_lines)
+                    p_y1 = max(l["bbox"][3] for l in para_lines)
 
-                layout_blocks.append({
-                    "id": block_id,
-                    "bbox": bbox,
-                    "text": text,
-                    "font_size": round(avg_size, 1),
-                    "color": hex_color,
-                    "angle": angle,
-                    "is_heading": is_heading,
-                    "is_bold": is_bold,
-                    "is_watermark": is_watermark,
-                })
-                block_id += 1
+                    # For multi-line body columns (width > 150 pt), align left & right margins to column
+                    # so translations wrap naturally without being artificially cut off on 1-line paragraphs
+                    if abs(angle) <= 5 and b_width > 150:
+                        if abs(p_x0 - b_min_x0) <= 20:
+                            p_x0 = b_min_x0
+                        p_x1 = max(p_x1, b_max_x1)
+
+                    bbox = [round(p_x0, 2), round(p_y0, 2), round(p_x1, 2), round(p_y1, 2)]
+                    bw = bbox[2] - bbox[0]
+                    bh = bbox[3] - bbox[1]
+
+                    # Watermark detection
+                    is_diagonal = (abs(angle) > 10 and abs(angle) < 80) or (abs(angle) > 100 and abs(angle) < 170)
+                    watermark_keywords = ("internal use", "confidential", "proprietary", "draft", "watermark", "sample", "strictly private", "hsptek", "do not distribute")
+                    text_lower = text.lower()
+                    is_watermark_text = any(kw in text_lower for kw in watermark_keywords)
+                    is_huge_sparse = (bw > page.rect.width * 0.35 and bh > page.rect.height * 0.25 and (is_diagonal or len(text.split()) < 15))
+                    is_watermark = is_diagonal or is_watermark_text or is_huge_sparse
+
+                    layout_blocks.append({
+                        "id": block_id,
+                        "bbox": bbox,
+                        "text": text,
+                        "font_size": round(avg_size, 1),
+                        "color": hex_color,
+                        "angle": angle,
+                        "is_heading": is_heading,
+                        "is_bold": is_bold,
+                        "is_watermark": is_watermark,
+                    })
+                    block_id += 1
 
             # 2. OCR text inside embedded diagram images (only for single page or small docs)
             ocr = get_ocr_engine() if (target_page is not None or len(document) <= 5) else None
