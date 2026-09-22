@@ -1,0 +1,11 @@
+PyMuPDF>=1.22.0
+torch
+transformers
+ctranslate2
+sentencepiece
+protobuf
+tiktoken
+rapidocr-onnxruntime
+pillow
+huggingface_hub
+llama-cpp-python

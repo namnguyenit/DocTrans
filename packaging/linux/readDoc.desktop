@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=readDoc
+Comment=Đọc và dịch tài liệu Anh-Việt hoàn toàn offline
+Exec=readDoc %F
+Icon=readDoc
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupWMClass=readDoc

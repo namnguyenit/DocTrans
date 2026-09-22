@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+export PATH="$APPDIR/usr/bin:${PATH:-/usr/bin:/bin}"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib:${LD_LIBRARY_PATH:-}"
+export QT_PLUGIN_PATH="$APPDIR/usr/lib/qt6/plugins"
+export PYTHONHOME="$APPDIR/usr"
+export PYTHONPATH="$APPDIR/usr/lib/python3.10/site-packages"
+export READDOC_RESOURCE_DIR="$APPDIR/usr/share/readDoc"
+export READDOC_PYTHON="$APPDIR/usr/bin/python3"
+export READDOC_NMT_MODEL="$APPDIR/usr/share/readDoc/model"
+export READDOC_NMT_TOKENIZER="$APPDIR/usr/share/readDoc/tokenizer"
+export READDOC_NMT_BACKEND="ctranslate2"
+export READDOC_NMT_INTRA_THREADS="${READDOC_NMT_INTRA_THREADS:-16}"
+export READDOC_NMT_INTER_THREADS="${READDOC_NMT_INTER_THREADS:-1}"
+export TESSDATA_PREFIX="$APPDIR/usr/share/tesseract-ocr/tessdata"
+
+# Never let a library attempt to resolve or download a remote model.
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+exec "$APPDIR/usr/bin/readDoc" "$@"

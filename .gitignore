@@ -1,0 +1,57 @@
+# Build outputs and temporary directories
+build/
+bin/
+lib/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.ninja
+.ninja_*
+
+# Executables and libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.obj
+*.o
+
+# Compressed archives & installers
+*.zip
+*.rar
+*.7z
+*.tar.gz
+*.AppImage
+
+# Large model weights (use download_model.py to fetch)
+models/
+model/
+*.gguf
+*.safetensors
+*.bin
+*.onnx
+
+# Python Virtual Environments & caches
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

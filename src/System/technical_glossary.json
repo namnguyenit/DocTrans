@@ -1,0 +1,10 @@
+{
+  "affinity constraints": "các ràng buộc CPU affinity",
+  "bootloader": "bootloader",
+  "clock controller": "clock controller",
+  "device tree node": "node device tree",
+  "kernel scheduler": "bộ lập lịch kernel",
+  "probing the driver": "khi driver thực hiện probe",
+  "asynchronous transfer": "quá trình truyền bất đồng bộ",
+  "register state": "trạng thái thanh ghi"
+}
