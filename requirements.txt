@@ -9,3 +9,5 @@ rapidocr-onnxruntime
 pillow
 huggingface_hub
 llama-cpp-python
+accelerate
+bitsandbytes; platform_system == "Windows" or platform_system == "Linux"

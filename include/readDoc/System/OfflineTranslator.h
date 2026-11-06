@@ -5,6 +5,8 @@
 #include <QProcess>
 #include <QTimer>
 #include <QPair>
+#include <QJsonObject>
+#include "readDoc/System/TranslationScheduler.h"
 
 class OfflineTranslator : public QObject {
     Q_OBJECT
@@ -31,8 +33,11 @@ public:
     explicit OfflineTranslator(QObject *parent = nullptr);
     ~OfflineTranslator();
 
-    void requestAsyncTranslation(int reqId, const QString &sentence);
-    void requestPolishOnlyAsync(int reqId, const QString &sourceEn, const QString &rawVi);
+    int allocateRequestId() { return m_scheduler.nextRequestId(); }
+    int registerClient() { return m_scheduler.newClient(); }
+    void requestAsyncTranslation(int reqId, const QString &sentence, int client = 0, const QString &context = {});
+    void requestPolishOnlyAsync(int reqId, const QString &sourceEn, const QString &rawVi, int client = 0, const QString &context = {});
+    void cancelClient(int client);
     void cancelQueuedTranslations();
     void clearCache();
     void restartDaemon();
@@ -42,6 +47,8 @@ public:
     bool isNmtInitialized() const { return m_nmtInitialized; }
     bool isPolishAvailable() const { return m_polishAvailable; }
     QString polishModelName() const { return m_polishModelName; }
+    void requestModelDiagnostics();
+    QJsonObject modelDiagnostics() const { return m_modelDiagnostics; }
 
     ModelStatus nmtStatus() const { return m_nmtStatus; }
     ModelStatus polishStatus() const { return m_polishStatus; }
@@ -53,7 +60,6 @@ public:
 
 private:
     void initNmtDaemon();
-    void queryNmtModelAsync(int reqId, const QString &text);
     QString postProcessTranslation(const QString &raw);
 
     QProcess *m_nmtProcess = nullptr;
@@ -61,6 +67,7 @@ private:
     bool      m_nmtInitialized = false;
     bool      m_polishAvailable = false;
     QString   m_polishModelName;
+    QJsonObject m_modelDiagnostics;
 
     ModelStatus m_nmtStatus = ModelStatus::Loading;
     ModelStatus m_polishStatus = ModelStatus::Loading;
@@ -68,7 +75,8 @@ private:
     QString     m_polishError;
 
     QTimer m_batchTimer;
-    QList<QPair<int, QString>> m_translationQueue;
+    TranslationScheduler m_scheduler;
+    void failPendingRequests(const QString &error);
 
     static constexpr int kPreferredBatchSize = 32;  // Match Python RESPONSE_GROUP_SIZE
 

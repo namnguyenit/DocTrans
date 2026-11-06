@@ -719,6 +719,61 @@ def split_lines_into_paragraphs(lines, angle):
     return paras
 
 
+def simplify_dense_nontext_patterns(document):
+    """Avoid expanding millions of decorative tiles in MuPDF's text device.
+
+    Changes exist only in this reader's in-memory document. Rendering/export
+    still open the untouched source PDF. Keep any pattern containing text, a
+    recursive/unknown resource, or an excessively large uninspected stream.
+    """
+    reference_re = re.compile(r"\b(\d+)\s+\d+\s+R\b")
+    text_operator_re = re.compile(rb"\b(?:BT|Tj|TJ)\b")
+    inspected = {}
+
+    def has_text(xref, visiting=frozenset()):
+        if xref in inspected:
+            return inspected[xref]
+        if xref in visiting or len(visiting) >= 24:
+            return True
+        if document.xref_get_key(xref, "Subtype") == ("name", "/Image"):
+            return False
+        try:
+            content = document.xref_stream(xref) if document.xref_is_stream(xref) else b""
+            if len(content) > 2_000_000 or text_operator_re.search(content):
+                return True
+            references = reference_re.findall(document.xref_object(xref))
+            if len(references) > 256:
+                return True
+            result = any(has_text(int(ref), visiting | {xref}) for ref in references)
+            inspected[xref] = result
+            return result
+        except Exception:
+            return True
+
+    changed = []
+    for xref in range(1, document.xref_length()):
+        try:
+            if document.xref_get_key(xref, "PatternType") != ("int", "1"):
+                continue
+            xstep = abs(float(document.xref_get_key(xref, "XStep")[1]))
+            ystep = abs(float(document.xref_get_key(xref, "YStep")[1]))
+            matrix_text = document.xref_get_key(xref, "Matrix")[1]
+            matrix = [float(v) for v in re.findall(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", matrix_text)]
+            if matrix_text != "null" and len(matrix) != 6:
+                continue
+            determinant = abs(matrix[0] * matrix[3] - matrix[1] * matrix[2]) if len(matrix) == 6 else 1.0
+            cell_area = xstep * ystep * determinant
+            if not 0 < cell_area < 0.01 or has_text(xref):
+                continue
+            document.xref_set_key(xref, "XStep", "1000000")
+            document.xref_set_key(xref, "YStep", "1000000")
+            document.update_stream(xref, b"")
+            changed.append(xref)
+        except Exception:
+            continue
+    return changed
+
+
 def extract_pdf_pages(filepath, target_page=None, include_images=False, password=None):
     try:
         document = fitz.open(filepath)
@@ -735,7 +790,10 @@ def extract_pdf_pages(filepath, target_page=None, include_images=False, password
 
     pages = []
     try:
-        body_font_size = detect_body_font_size(document)
+        simplified_patterns = simplify_dense_nontext_patterns(document)
+        if simplified_patterns:
+            print(f"[pdf] Bypassed {len(simplified_patterns)} dense graphic-only patterns for text extraction",
+                  file=sys.stderr, flush=True)
         repeated_fragments, repeated_margin_images = (
             detect_repeated_margin_fragments(document)
             if len(document) <= 15 else (set(), set())
@@ -747,7 +805,10 @@ def extract_pdf_pages(filepath, target_page=None, include_images=False, password
 
         for page_idx in page_indices:
             page = document[page_idx]
-            text_dict = page.get_text("dict", sort=False)
+            text_flags = fitz.TEXTFLAGS_DICT
+            if not (include_images or target_page is not None or len(document) <= 5):
+                text_flags &= ~fitz.TEXT_PRESERVE_IMAGES
+            text_dict = page.get_text("dict", sort=False, flags=text_flags)
             
             layout_blocks = []
             block_id = 0

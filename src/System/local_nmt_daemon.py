@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private, local-only English to Vietnamese translation daemon with 2-Stage Pipeline (VinAI Fast NMT + Arcee-VyLinh Background LLM Polish)."""
+"""Local English–Vietnamese pipeline: VinAI preview and contextual refinement."""
 
 import json
 import hashlib
@@ -12,8 +12,13 @@ import platform
 import threading
 import time
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 from pathlib import Path
+from functools import wraps
+from types import MethodType
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from local_cuda_server import LocalCudaServer, find_server
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -96,6 +101,13 @@ def resolve_polish_model_path():
             return str(p.resolve())
     
     if MODELS_ROOT:
+        gguf = MODELS_ROOT / "polish/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q6_K.gguf"
+        if (gguf.is_file() and gguf.stat().st_size > 3_000_000_000
+                and (gguf.parent / "tokenizer.json").is_file()
+                and (gguf.parent / "config.json").is_file()
+                and (gguf.parent / "tokenizer_config.json").is_file()
+                and find_server(MODELS_ROOT)):
+            return str(gguf.resolve())
         c0 = MODELS_ROOT / "polish" / "Arcee-VyLinh"
         if c0.is_dir() and (c0 / "config.json").exists():
             return str(c0.resolve())
@@ -155,8 +167,16 @@ TOKEN_BATCH_BUDGET = int(os.environ.get("READDOC_NMT_TOKEN_BUDGET", "3072"))    
 REQUEST_TOKEN_BUDGET = int(os.environ.get("READDOC_NMT_REQUEST_TOKEN_BUDGET", "3072"))
 RESPONSE_GROUP_SIZE = int(os.environ.get("READDOC_NMT_RESPONSE_GROUP_SIZE", "32"))  # Smaller JSON batches
 POLISH_QUEUE_MAX    = int(os.environ.get("READDOC_POLISH_QUEUE_MAX", "512"))       # Stop queue bloat
+POLISH_BATCH_SIZE = max(1, int(os.environ.get("READDOC_POLISH_BATCH_SIZE", "24")))
+POLISH_TOKEN_BUDGET = max(256, int(os.environ.get("READDOC_POLISH_TOKEN_BUDGET", "12288")))
+POLISH_MAX_NEW_TOKENS = max(24, int(os.environ.get("READDOC_POLISH_MAX_NEW_TOKENS", "384")))
+POLISH_METRICS = os.environ.get("READDOC_POLISH_METRICS", "0") == "1"
+# Context is source-only and supplied by the document, never by queue order.
+POLISH_CONTEXT_CHARS = 600
+FUSED_RMSNORM = os.environ.get("READDOC_FUSED_RMSNORM", "1") == "1"
+POLISH_TASK = os.environ.get("READDOC_POLISH_TASK", "refine")
 CACHE_CAPACITY = int(os.environ.get("READDOC_NMT_CACHE_SIZE", "4096"))
-CACHE_SCHEMA_VERSION = "5"
+CACHE_SCHEMA_VERSION = "6"
 TARGET_LANGUAGE = "vi_VN"
 SEGMENTATION_VERSION = "page-units-300-v2"
 
@@ -174,16 +194,120 @@ model_fingerprint = "uninitialized"
 polish_model = None
 polish_tokenizer = None
 polish_ready = False
+polish_status = "loading"
 polish_backend = "none"
+polish_profile = "vylinh"
 polish_model_name = "none"
+polish_fingerprint = "uninitialized"
+polish_metrics = Counter()
+polish_metrics_lock = threading.Lock()
+
+
+def count_polish_metric(name, value=1):
+    with polish_metrics_lock:
+        polish_metrics[name] += value
+
+
+def snapshot_polish_metrics(reset=False):
+    with polish_metrics_lock:
+        result = dict(polish_metrics)
+        if reset:
+            polish_metrics.clear()
+        return result
 polish_queue = queue.Queue(maxsize=POLISH_QUEUE_MAX)   # Bounded to prevent memory bloat
 polish_thread = None
 stdout_lock = threading.Lock()
+# Both models share one GPU: bound simultaneous activation/KV allocations.
+gpu_lock = threading.RLock()
+polish_load_lock = threading.Lock()
+cache_lock = threading.RLock()
+request_state_lock = threading.RLock()
+active_requests = set()
+cancelled_requests = set()
 
 
 def emit_json(obj):
+    terminal = [row.get("id", 0) for row in obj.get("results", [])
+                if row.get("stage") == "polish"]
+    terminal.extend(row.get("id", 0) for row in obj.get("failures", []))
+    with request_state_lock:
+        active_requests.difference_update(terminal)
+        cancelled_requests.difference_update(terminal)
     with stdout_lock:
         print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def cache_guard(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        with cache_lock:
+            return function(*args, **kwargs)
+    return guarded
+
+
+@cache_guard
+def commit_cache():
+    if cache_db is not None:
+        cache_db.commit()
+        secure_cache_permissions()
+
+
+@cache_guard
+def clear_translation_memory():
+    cache.clear()
+    if cache_db is not None:
+        cache_db.execute("DELETE FROM translations")
+        cache_db.commit()
+        cache_db.execute("VACUUM")
+        secure_cache_permissions()
+
+
+def is_cancelled(req_id):
+    with request_state_lock:
+        return req_id in cancelled_requests
+
+
+def cancel_request_ids(ids):
+    with request_state_lock:
+        cancelled_requests.update(set(ids) & active_requests)
+        finished = set(ids) - active_requests
+    if finished:
+        emit_json({"results": [{"id": i, "translated": "", "stage": "polish", "cancelled": True}
+                               for i in finished]})
+
+
+def finish_waiting_polish():
+    """Release waiting jobs if the optional model cannot load."""
+    while True:
+        try:
+            item = polish_queue.get_nowait()
+        except queue.Empty:
+            break
+        if item is not None:
+            emit_json({"results": [{"id": item[0], "translated": item[2], "stage": "polish"}]})
+        polish_queue.task_done()
+
+
+def enqueue_polish(req_id, source, raw, context=""):
+    with request_state_lock:
+        active_requests.add(req_id)
+    if is_cancelled(req_id) or not is_polish_eligible(source, raw):
+        emit_json({"results": [{"id": req_id, "translated": raw, "stage": "polish"}]})
+        return
+    # Retain raw results during startup. A full queue applies backpressure;
+    # it must never silently label an unpolished sentence as polished.
+    while polish_ready or polish_status == "loading":
+        if is_cancelled(req_id):
+            break
+        try:
+            item = (req_id, source, raw, context) if context else (req_id, source, raw)
+            polish_queue.put(item, timeout=0.2)
+            if not polish_ready and polish_status in ("disabled", "crashed"):
+                finish_waiting_polish()
+            return
+        except queue.Full:
+            continue
+    emit_json({"results": [{"id": req_id, "translated": raw, "stage": "polish"}]})
 
 
 def cache_database_path():
@@ -221,6 +345,9 @@ GLOSSARY_FINGERPRINT = hashlib.sha256(
 # Identifiers, commands, paths, URLs and numeric constants should remain verbatim.
 TECH_TOKEN_RE = re.compile(
     r"https?://\S+|"
+    r"\.(?:[ \t]*\.){4,}|"
+    r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|"
+    r"\b(?=[A-Za-z0-9]*[0-9])[A-Za-z][A-Za-z0-9]+\b|"
     r"(?<!\w)--?[a-zA-Z][\w-]*|"
     r"(?:[/~.]?[\w.-]+/)+[\w.-]+|"
     r"\b(?:0x[0-9a-fA-F]+|[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+)\b|"
@@ -228,6 +355,7 @@ TECH_TOKEN_RE = re.compile(
     r"`[^`]+`"
 )
 PLACEHOLDER_RE = re.compile(r"__TECH\d+__")
+DOT_LEADER_RE = re.compile(r"\.(?:[ \t]*\.){4,}")
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`\[])")
 
 
@@ -298,6 +426,7 @@ def secure_cache_permissions():
             pass
 
 
+@cache_guard
 def init_cache_db():
     global cache_db
     try:
@@ -333,6 +462,7 @@ def make_cache_key(text):
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+@cache_guard
 def cache_get(text):
     key = make_cache_key(text)
     value = cache.get(key)
@@ -356,6 +486,7 @@ def cache_get(text):
     return None
 
 
+@cache_guard
 def cache_put(text, translation):
     key = make_cache_key(text)
     cache[key] = translation
@@ -409,7 +540,7 @@ def generate_chunks_pytorch(chunks):
         longest_source = max(item[0] for item in batch)
         max_new_tokens = min(384, max(64, int(longest_source * 1.6) + 24))
 
-        with torch.inference_mode():
+        with gpu_lock, torch.inference_mode():
             output = model.generate(
                 **inputs,
                 decoder_start_token_id=tokenizer.lang_code_to_id[TARGET_LANGUAGE],
@@ -451,13 +582,14 @@ def generate_chunks_ctranslate2(chunks):
         ]
         prefixes = [[target_token] for _item in batch]
         max_decoding_length = min(384, max(64, int(longest * 1.6) + 24))
-        outputs = model.translate_batch(
-            source_tokens,
-            target_prefix=prefixes,
-            beam_size=1,
-            max_decoding_length=max_decoding_length,
-            return_scores=False,
-        )
+        with gpu_lock:
+            outputs = model.translate_batch(
+                source_tokens,
+                target_prefix=prefixes,
+                beam_size=1,
+                max_decoding_length=max_decoding_length,
+                return_scores=False,
+            )
         for item, output in zip(batch, outputs):
             tokens = output.hypotheses[0]
             if tokens and tokens[0] == target_token:
@@ -506,8 +638,7 @@ def translate_text_batch(texts):
             results[index] = translated
     if cache_db is not None:
         try:
-            cache_db.commit()
-            secure_cache_permissions()
+            commit_cache()
         except Exception:
             pass
 
@@ -515,7 +646,7 @@ def translate_text_batch(texts):
 
 
 # =========================================================================
-# Polish Worker & LLM Handling (100% CUDA GPU, 0% CPU, Dynamic Batching)
+# Polish worker: bounded, length-bucketed CUDA batches.
 # =========================================================================
 
 def is_polish_eligible(en_text, vi_raw):
@@ -524,125 +655,325 @@ def is_polish_eligible(en_text, vi_raw):
     words = vi_raw.strip().split()
     if len(words) < 3:
         return False
-    if any(tag in en_text for tag in ["class ", "def ", "#include", "void "]):
+    if re.search(r"\b(?:class|def|void)\s|#include", en_text):
         return False
     return True
+
+
+def protect_dot_leaders(text):
+    leaders = {}
+    def replace(match):
+        marker = f"__LEADER{len(leaders)}__"
+        leaders[marker] = match.group(0)
+        return marker
+    return DOT_LEADER_RE.sub(replace, text), leaders
+
+
+def polish_prompt(en_text, vi_raw, context=""):
+    context = context[-POLISH_CONTEXT_CHARS:]
+    if polish_profile == "qwen35":
+        en_text, _ = protect_dot_leaders(en_text)
+        context = DOT_LEADER_RE.sub(" … ", context)
+    if polish_profile in ("qwen", "qwen35"):
+        return polish_tokenizer.apply_chat_template([
+            {"role": "system", "content":
+             "Bạn là biên dịch viên Anh–Việt. Dịch chính xác phần Source Text sang tiếng Việt tự nhiên. "
+             "Dùng Background Information chỉ để chọn nghĩa của từ; không chèn chi tiết chỉ có trong ngữ cảnh. "
+             "Vietnamese Draft là bản tham khảo cách diễn đạt, có thể sai nghĩa; sửa nó theo Source Text và ngữ cảnh. "
+             "Giữ nguyên ý nghĩa, phủ định, điều kiện, số liệu, tên biến và ký hiệu. "
+             "Chỉ trả về bản dịch, không giải thích."},
+            {"role": "user", "content":
+             (f"[Background Information]\n{context}\n" if context else "") + f"[Source Text]\n{en_text}"
+             + (f"\n[Vietnamese Draft]\n{vi_raw}" if POLISH_TASK == "refine" and polish_profile != "qwen35" else "")}
+        ], tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    if polish_profile == "hymt":
+        prompt = (
+            (f"[Background Information]\n{context}\n" if context else "")
+            + "Translate only the [Source Text] into Vietnamese, taking any background "
+            "information into consideration. Only output the translation without explanation. "
+            "Preserve numbers, identifiers and placeholders.\n"
+            f"[Source Text]\n{en_text}"
+        )
+        return polish_tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+    background = (f"- Ngữ cảnh tham khảo (không dịch phần này): {context}\n" if context else "")
+    return (
+        f"<|im_start|>system\n"
+        f"Bạn là chuyên gia dịch thuật và biên tập văn phong tiếng Việt. "
+        f"Hiệu đính bản dịch dựa trên câu gốc tiếng Anh. Giữ đúng ý nghĩa, phủ định, "
+        f"điều kiện, số liệu và thuật ngữ. Ngữ cảnh chỉ giúp chọn nghĩa của từ; "
+        f"không đưa thông tin từ ngữ cảnh vào bản dịch. Không thêm giải thích, "
+        f"không suy diễn. Chỉ trả về bản dịch của câu gốc.<|im_end|>\n"
+        f"<|im_start|>user\n"
+        f"{background}"
+        f"- Câu gốc: {en_text}\n"
+        f"- Bản dịch thô: {vi_raw}\n"
+        f"Viết lại câu hoàn chỉnh:<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+def polish_cache_key(en_text, vi_raw, context=""):
+    # Include the raw translation and polish model, not only the English source.
+    return "polish-context-v5::" + json.dumps(
+        [str(POLISH_MODEL_PATH), polish_fingerprint, polish_profile, polish_backend,
+         FUSED_RMSNORM, POLISH_TASK, en_text, vi_raw, context[-POLISH_CONTEXT_CHARS:]], ensure_ascii=False)
+
+
+def preserves_source_literals(source, result):
+    """Reject observable corruption; this is not a semantic accuracy metric."""
+    numbers = lambda text: Counter(re.findall(r"(?<![\w.])[-+]?\d+(?:[.,]\d+)*\b", text.replace("−", "-")))
+    if numbers(source) != numbers(result):
+        return False
+    source_literals = Counter(TECH_TOKEN_RE.findall(source))
+    result_literals = Counter(TECH_TOKEN_RE.findall(result))
+    if any(result_literals[token] < count for token, count in source_literals.items()):
+        return False
+    literals = re.findall(
+        r"\{\{[\w.]+\}\}|\$?\{[\w.]+\}|%\([\w]+\)s|%[sd]|%\d+", source)
+    if any(token not in result for token in literals):
+        return False
+    if not re.search(r"[\u3400-\u9fff]", source) and re.search(r"[\u3400-\u9fff]", result):
+        return False
+    return True
+
+
+def generate_polish_batch(prepared):
+    """One actual GPU generate call. Own tensors here so OOM retries free them."""
+    prompts = [entry[1] for entry in prepared]
+    max_new = max(entry[2] for entry in prepared)
+    count_polish_metric("model_rows", len(prepared))
+    if polish_backend == "llama_server_cuda":
+        # llama.cpp refills a finished slot immediately while other slots decode.
+        with gpu_lock:
+            rows = polish_model.complete_batch(prompts, max_new)
+        return [finish_polish(entry, row.get("content", ""),
+                              row.get("stop_type") in ("eos", "word") and not row.get("truncated", False))
+                for entry, row in zip(prepared, rows)]
+    with gpu_lock, torch.inference_mode():
+        inputs = polish_tokenizer(prompts, return_tensors="pt", padding=True).to("cuda")
+        width = inputs["input_ids"].shape[1]
+        outputs = polish_model.generate(
+            **inputs, max_new_tokens=max_new, do_sample=False,
+            pad_token_id=polish_tokenizer.pad_token_id,
+            eos_token_id=polish_tokenizer.eos_token_id, use_cache=True,
+        )
+        generated = outputs[:, width:].cpu()
+    texts = polish_tokenizer.batch_decode(generated, skip_special_tokens=True)
+    results = []
+    truncated = 0
+    for entry, tokens, text in zip(prepared, generated.tolist(), texts):
+        # A budget-limited response can end mid-sentence; retain the raw text.
+        complete = polish_tokenizer.eos_token_id in tokens
+        truncated += not complete
+        results.append(finish_polish(entry, text, complete))
+    if truncated:
+        print(f"[polish] {truncated}/{len(prepared)} responses reached the output limit; "
+              "keeping raw translations", file=sys.stderr, flush=True)
+    return results
+
+
+def finish_polish(entry, text, complete):
+    req_id, en_text, vi_raw = entry[0][:3]
+    context = entry[0][3] if len(entry[0]) > 3 else ""
+    text = text.strip()
+    for prefix in ["- ", "Bản dịch hoàn thiện:", "Viết lại:", "Câu hoàn chỉnh:", "Bản dịch:"]:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+    text = text.strip(' "\'')
+    leaders_valid = True
+    if polish_profile == "qwen35":
+        _, leaders = protect_dot_leaders(en_text)
+        for marker, original in leaders.items():
+            text = text.replace(f"`{marker}`", marker)
+            leaders_valid = leaders_valid and text.count(marker) == 1
+            text = text.replace(marker, original)
+    accepted = complete and leaders_valid and len(text) >= 4 and preserves_source_literals(en_text, text)
+    count_polish_metric("complete_rows" if complete else "truncated_rows")
+    if accepted:
+        count_polish_metric("accepted_rows")
+        cache_put(polish_cache_key(en_text, vi_raw, context), text)
+    elif complete:
+        count_polish_metric("literal_rejections" if len(text) >= 4 else "empty_rejections")
+    return req_id, text if accepted else vi_raw
+
+
+def run_polish_batch(prepared):
+    global polish_ready, polish_status
+    try:
+        return generate_polish_batch(prepared)
+    except Exception as exc:
+        oom = isinstance(exc, torch.cuda.OutOfMemoryError)
+        count_polish_metric("generation_failures")
+        print(f"[polish] {'CUDA OOM' if oom else 'Generation failed'}: {exc}",
+              file=sys.stderr, flush=True)
+        # Release traceback references to failed CUDA tensors before retrying.
+        exc.__traceback__ = None
+        if (polish_backend == "llama_server_cuda" and polish_model.process.poll() is not None):
+            polish_ready = False
+            polish_status = "crashed"
+            emit_json({"polish_available": False, "polish_status": "crashed",
+                       "polish_error": "The local CUDA engine stopped; raw translations were retained"})
+            finish_waiting_polish()
+            polish_model.close()
+    if oom:
+        count_polish_metric("oom_retries")
+        with gpu_lock:
+            torch.cuda.empty_cache()
+        if len(prepared) > 1:
+            middle = len(prepared) // 2
+            return run_polish_batch(prepared[:middle]) + run_polish_batch(prepared[middle:])
+    return [(entry[0][0], entry[0][2]) for entry in prepared]
+
+
 def polish_batch(batch_items):
-    """Polish on GPU 4-bit NF4 with VRAM safety checks."""
+    """Batch independent prompts, bucket lengths and bound padded token usage."""
     if not polish_ready or not batch_items:
         return [(item[0], item[2]) for item in batch_items]
-
-    results = []
-    to_process = []
+    results = {}
+    prepared = []
     for item in batch_items:
-        req_id, en_text, vi_raw = item
+        req_id, en_text, vi_raw = item[:3]
+        context = item[3] if len(item) > 3 else ""
         if not is_polish_eligible(en_text, vi_raw):
-            results.append((req_id, vi_raw))
+            count_polish_metric("skipped_rows")
+            results[req_id] = vi_raw
             continue
-        to_process.append(item)
-
-    if not to_process:
-        return results
-
-    for i, (req_id, en_text, vi_raw) in enumerate(to_process):
-        cache_key = f"polish::{en_text}"
-        cached = cache_get(cache_key)
-        if cached:
-            results.append((req_id, cached))
+        cached = cache_get(polish_cache_key(en_text, vi_raw, context))
+        if cached is not None:
+            count_polish_metric("cache_hits")
+            results[req_id] = cached
             continue
-
-        # Periodic VRAM cleanup to prevent fragmentation
-        if i % 4 == 0 and torch is not None and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            # VRAM safety guard: if >90% used, skip remaining and return raw
-            total = torch.cuda.get_device_properties(0).total_memory
-            used  = torch.cuda.memory_allocated()
-            if used / total > 0.90:
-                print(f"[polish] VRAM {used/1024**3:.2f}GB/{total/1024**3:.2f}GB >90% — skipping polish",
-                      file=sys.stderr, flush=True)
-                results.append((req_id, vi_raw))
-                continue
-
-        prompt = (
-            f"<|im_start|>system\n"
-            f"Bạn là chuyên gia dịch thuật và biên tập văn phong tiếng Việt. "
-            f"Hãy viết lại câu dịch sau sao cho tự nhiên, mượt mà và thuần Việt nhất, "
-            f"nhưng phải giữ nguyên vẹn ý nghĩa của câu tiếng Anh và các thuật ngữ chuyên ngành. "
-            f"Không thêm bớt thông tin. Trả về duy nhất câu đã viết lại.<|im_end|>\n"
-            f"<|im_start|>user\n"
-            f"- Câu gốc: {en_text}\n"
-            f"- Bản dịch thô: {vi_raw}\n"
-            f"Viết lại câu hoàn chỉnh:<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-
+        prompt = polish_prompt(en_text, vi_raw, context)
+        input_tokens = len(polish_tokenizer.encode(prompt))
+        raw_tokens = len(polish_tokenizer.encode(vi_raw, add_special_tokens=False))
+        if polish_profile in ("hymt", "qwen", "qwen35"):
+            # A weak/short NMT draft must not constrain a direct translation.
+            raw_tokens = max(raw_tokens, len(polish_tokenizer.encode(en_text, add_special_tokens=False)))
+        max_new = min(POLISH_MAX_NEW_TOKENS, max(24, int(raw_tokens * 1.35) + 16))
+        if polish_backend == "llama_server_cuda":
+            # Each native slot stops on EOS independently. Give Vietnamese the
+            # full bounded allowance; a weak/short preview must not cut it off.
+            max_new = POLISH_MAX_NEW_TOKENS
+        # Do not silently truncate source/translation to fit the context budget.
+        context_limit = polish_model.context_per_slot if polish_backend == "llama_server_cuda" else POLISH_TOKEN_BUDGET
+        if input_tokens + max_new > min(POLISH_TOKEN_BUDGET, context_limit):
+            count_polish_metric("context_rejections")
+            results[req_id] = vi_raw
+            continue
+        prepared.append((item, prompt, max_new, input_tokens))
+    prepared.sort(key=lambda entry: entry[3] + entry[2])
+    cursor = 0
+    started = time.perf_counter()
+    while cursor < len(prepared):
+        batch = []
+        longest_input = longest_output = 0
+        while cursor < len(prepared) and len(batch) < POLISH_BATCH_SIZE:
+            entry = prepared[cursor]
+            new_input = max(longest_input, entry[3])
+            new_output = max(longest_output, entry[2])
+            if (batch and polish_backend != "llama_server_cuda"
+                    and (new_input + new_output) * (len(batch) + 1) > POLISH_TOKEN_BUDGET):
+                break
+            batch.append(entry)
+            cursor += 1
+            longest_input, longest_output = new_input, new_output
+        results.update(run_polish_batch(batch))
+    if cache_db is not None:
         try:
-            inputs = polish_tokenizer(prompt, return_tensors="pt").to("cuda")
-            input_len = inputs["input_ids"].shape[1]
-            max_new = min(96, max(24, int(len(vi_raw.split()) * 1.5) + 10))
-            with torch.inference_mode():
-                outputs = polish_model.generate(
-                    **inputs,
-                    max_new_tokens=max_new,
-                    do_sample=False,
-                    pad_token_id=polish_tokenizer.eos_token_id,
-                    use_cache=True,
-                )
-            gen = polish_tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
-            for prefix in ["- ", "Bản dịch hoàn thiện:", "Viết lại:", "Câu hoàn chỉnh:", "Bản dịch:"]:
-                if gen.startswith(prefix):
-                    gen = gen[len(prefix):].strip()
-            gen = gen.strip(' "\'')
-            final_text = gen if gen and len(gen) >= 4 else vi_raw
-            cache_put(cache_key, final_text)
-            results.append((req_id, final_text))
-            if cache_db is not None:
-                try:
-                    cache_db.commit()
-                except Exception:
-                    pass
-        except Exception as exc:
-            print(f"CUDA Polish generation failed: {exc}", file=sys.stderr, flush=True)
-            if torch is not None and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            results.append((req_id, vi_raw))
-
-    return results
+            commit_cache()
+        except sqlite3.Error as exc:
+            print(f"[polish] Cache commit failed: {exc}", file=sys.stderr, flush=True)
+    if POLISH_METRICS and prepared:
+        print(f"[polish] items={len(prepared)} elapsed={time.perf_counter()-started:.3f}s "
+              f"batch_limit={POLISH_BATCH_SIZE} queue={polish_queue.qsize()}",
+              file=sys.stderr, flush=True)
+    return [(item[0], results[item[0]]) for item in batch_items]
 
 
 def polish_worker_loop():
     while True:
+        batch = []
+        stop = False
         try:
             item = polish_queue.get()
             if item is None:
+                polish_queue.task_done()
                 break
             batch = [item]
-            # Drain up to 1 more item (keep batch tiny for 4-bit stability)
-            if len(batch) < 2:
+            while len(batch) < POLISH_BATCH_SIZE:
                 try:
                     next_item = polish_queue.get_nowait()
                     if next_item is None:
                         polish_queue.task_done()
+                        stop = True
+                        break
                     else:
                         batch.append(next_item)
                 except queue.Empty:
-                    pass
+                    break
 
-            results = polish_batch(batch)
+            skipped = [item for item in batch if is_cancelled(item[0])]
+            skipped_ids = {item[0] for item in skipped}
+            runnable = [item for item in batch if item[0] not in skipped_ids]
+            results = polish_batch(runnable)
+            results.extend((item[0], item[2]) for item in skipped)
             res_json = [{"id": r[0], "translated": r[1], "stage": "polish"} for r in results]
             emit_json({"results": res_json})
-            for _ in batch:
-                polish_queue.task_done()
         except Exception as exc:
             print(f"Polish worker loop error: {exc}", file=sys.stderr, flush=True)
-            if torch is not None and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            emit_json({"results": [
+                {"id": item[0], "translated": item[2], "stage": "polish"}
+                for item in batch]})
+        finally:
+            for _ in batch:
+                polish_queue.task_done()
+        if stop:
+            break
 
 
 def _init_polish_model_background():
-    """Load Arcee-VyLinh 4-bit in background after VinAI is ready.
+    # A restart during loading must not create two 3B models or two workers.
+    if not polish_load_lock.acquire(blocking=False):
+        return
+    try:
+        if polish_ready:
+            emit_json({"polish_available": True, "polish_status": "ready",
+                       "polish_model": polish_model_name})
+            return
+        _load_polish_model()
+    finally:
+        if not polish_ready and polish_status in ("disabled", "crashed"):
+            finish_waiting_polish()
+        polish_load_lock.release()
+
+
+def fused_rmsnorm_forward(module, hidden_states):
+    return torch.nn.functional.rms_norm(
+        hidden_states, module.weight.shape, module.weight, module.variance_epsilon)
+
+
+def enable_fused_rmsnorm(mdl):
+    """Use PyTorch's CUDA RMSNorm kernel for known equivalent inference layers.
+
+    No third-party CUDA extension or checkpoint mutation. Restrict to audited
+    Qwen norms: other architectures can use offset weights or a different formula.
+    """
+    count = 0
+    if not hasattr(torch.nn.functional, "rms_norm"):
+        return count
+    for module in mdl.modules():
+        if (type(module).__name__ in ("Qwen2RMSNorm", "Qwen3RMSNorm")
+                and module.weight.device.type == "cuda"):
+            module.forward = MethodType(fused_rmsnorm_forward, module)
+            count += 1
+    return count
+
+
+def _load_polish_model():
+    """Load a local refinement checkpoint after VinAI is ready.
     Emits a status update over stdout once the model is loaded."""
-    global polish_model, polish_tokenizer, polish_ready, polish_thread, polish_model_name, polish_backend, polish_status
+    global torch, polish_model, polish_tokenizer, polish_ready, polish_thread, polish_model_name, polish_backend, polish_status, polish_profile, polish_fingerprint, POLISH_MODEL_PATH
     polish_path = resolve_polish_model_path()
     if not polish_path:
         print("Polish model path not found. Running Stage 1 only.", file=sys.stderr, flush=True)
@@ -651,12 +982,72 @@ def _init_polish_model_background():
         return
 
     p_path = Path(polish_path)
-    # Prefer directory (PyTorch 4-bit NF4 CUDA — 2.5 GB VRAM, safe alongside VinAI)
-    if p_path.is_dir() or (p_path.parent / "Arcee-VyLinh").is_dir():
-        model_dir = str(p_path if p_path.is_dir() else (p_path.parent / "Arcee-VyLinh"))
+    POLISH_MODEL_PATH = polish_path
+    if p_path.suffix.lower() == ".gguf":
+        engine = None
         try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-            print(f"[bg] Initializing Polish Model 4-bit NF4 CUDA ({Path(model_dir).name}) ...",
+            if torch is None:
+                import torch as torch_module
+                torch = torch_module
+            if not torch.cuda.is_available():
+                raise RuntimeError("The CUDA refinement engine requires an NVIDIA GPU")
+            executable = find_server(MODELS_ROOT)
+            if executable is None:
+                raise RuntimeError("Local llama.cpp CUDA runtime not found")
+            from transformers import AutoConfig, AutoTokenizer
+            config = AutoConfig.from_pretrained(p_path.parent, local_files_only=True)
+            if config.model_type != "qwen3_5":
+                raise RuntimeError("The GGUF refinement profile requires a Qwen3.5 tokenizer/config")
+            tok = AutoTokenizer.from_pretrained(p_path.parent, local_files_only=True)
+            slots = max(1, min(8, int(os.environ.get("READDOC_LLAMA_SLOTS", "8"))))
+            context_size = max(1024, min(4096, int(os.environ.get("READDOC_LLAMA_CONTEXT_PER_SLOT", "2048"))))
+            cache_ram_mib = max(0, min(1024, int(os.environ.get("READDOC_LLAMA_CACHE_RAM_MIB", "0"))))
+            with gpu_lock:
+                engine = LocalCudaServer(p_path, executable, slots=slots, context_per_slot=context_size,
+                                         cache_ram_mib=cache_ram_mib)
+            polish_tokenizer = tok
+            polish_model = engine
+            polish_backend = "llama_server_cuda"
+            polish_profile = "qwen35"
+            identity = (f"{p_path.name}:{p_path.stat().st_size}:{p_path.stat().st_mtime_ns}:"
+                        + json.dumps(engine.generation_options, sort_keys=True))
+            polish_fingerprint = hashlib.sha256(identity.encode()).hexdigest()[:16]
+            polish_model_name = f"{p_path.stem} (CUDA, {slots} slots)"
+            polish_ready = True
+            polish_status = "ready"
+            if polish_thread is None or not polish_thread.is_alive():
+                polish_thread = threading.Thread(target=polish_worker_loop, daemon=True)
+                polish_thread.start()
+            print(f"[bg] {polish_model_name} ready; Flash Attention, continuous batching, "
+                  "all layers on GPU; thinking disabled", file=sys.stderr, flush=True)
+            emit_json({"polish_available": True, "polish_status": "ready", "polish_model": polish_model_name})
+            return
+        except Exception as exc:
+            if engine is not None:
+                engine.close()
+            polish_ready = False
+            polish_status = "crashed"
+            print(f"[bg] Could not start CUDA engine: {exc}", file=sys.stderr, flush=True)
+            emit_json({"polish_available": False, "polish_status": "crashed", "polish_error": str(exc)})
+            return
+    # Load directly onto CUDA; do not silently offload layers into system RAM.
+    if p_path.is_dir():
+        model_dir = str(p_path)
+        try:
+            if torch is None:
+                import torch as torch_module
+                torch = torch_module
+            if not torch.cuda.is_available():
+                raise RuntimeError("Refinement requires a CUDA-enabled PyTorch installation")
+            from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+            config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
+            if config.model_type not in ("qwen2", "qwen3", "hunyuan_v1_dense"):
+                raise RuntimeError(f"Unsupported refinement architecture: {config.model_type}")
+            polish_profile = {"hunyuan_v1_dense": "hymt", "qwen3": "qwen"}.get(config.model_type, "vylinh")
+            native = polish_profile == "hymt"
+            compute_dtype = torch.bfloat16 if native and torch.cuda.is_bf16_supported() else torch.float16
+            precision = "BF16" if compute_dtype == torch.bfloat16 else "FP16"
+            print(f"[bg] Initializing Polish Model ({Path(model_dir).name}) ...",
                   file=sys.stderr, flush=True)
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -665,34 +1056,46 @@ def _init_polish_model_background():
                 bnb_4bit_use_double_quant=True,
             )
             tok = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+            tok.padding_side = "left"
             if tok.pad_token is None:
                 tok.pad_token = tok.eos_token
+            load_options = {} if native else {"quantization_config": bnb_config}
             mdl = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                quantization_config=bnb_config,
+                model_dir, **load_options,
                 device_map="cuda",
+                dtype=compute_dtype,
+                attn_implementation="sdpa",
                 local_files_only=True,
-            )
+            ).eval()
+            fused_count = enable_fused_rmsnorm(mdl) if FUSED_RMSNORM else 0
             polish_tokenizer = tok
             polish_model = mdl
-            polish_backend = "torch_bnb4"
-            polish_model_name = "Arcee-VyLinh (4-bit NF4 CUDA)"
+            files = sorted(Path(model_dir).glob("*.safetensors"))
+            identity = config.to_json_string() + repr(
+                [(f.name, f.stat().st_size, f.stat().st_mtime_ns) for f in files])
+            polish_fingerprint = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+            polish_backend = "torch_" + precision.lower() if native else "torch_bnb4"
+            polish_model_name = f"{Path(model_dir).name} ({precision if native else '4-bit NF4'} CUDA)"
             polish_ready = True
             polish_status = "ready"
-            polish_thread = threading.Thread(target=polish_worker_loop, daemon=True)
-            polish_thread.start()
+            if polish_thread is None or not polish_thread.is_alive():
+                polish_thread = threading.Thread(target=polish_worker_loop, daemon=True)
+                polish_thread.start()
             vram_mb = 0
             if torch is not None and torch.cuda.is_available():
                 vram_mb = int(torch.cuda.memory_allocated() / 1024 / 1024)
-            print(f"[bg] Polish Model (4-bit NF4 CUDA) ready. VRAM: {vram_mb} MB",
+            print(f"[bg] {polish_model_name} ready. VRAM: {vram_mb} MB, fused norms={fused_count}",
                   file=sys.stderr, flush=True)
+            print(f"[bg] Polish config: batch<={POLISH_BATCH_SIZE}, "
+                  f"tokens<={POLISH_TOKEN_BUDGET}, output<={POLISH_MAX_NEW_TOKENS}, "
+                  f"dtype={precision}, attention=sdpa", file=sys.stderr, flush=True)
             # Notify Qt that polish is now available
             emit_json({"polish_available": True, "polish_status": "ready", "polish_model": polish_model_name})
             return
         except Exception as exc:
             polish_ready = False
             polish_status = "crashed"
-            print(f"[bg] Could not load 4-bit Polish Model: {exc}", file=sys.stderr, flush=True)
+            print(f"[bg] Could not load refinement model: {exc}", file=sys.stderr, flush=True)
             emit_json({"polish_available": False, "polish_status": "crashed", "polish_error": str(exc)})
             return
 
@@ -702,8 +1105,18 @@ def _init_polish_model_background():
 
 
 def init_polish_model():
-    """Schedule Arcee-VyLinh loading in a background daemon thread."""
+    """Schedule local refinement loading in a background daemon thread."""
     global polish_ready, polish_status
+    if (polish_ready and polish_backend == "llama_server_cuda"
+            and polish_model.process.poll() is not None):
+        polish_model.close()
+        polish_ready = False
+    if polish_ready:
+        emit_json({"polish_available": True, "polish_status": "ready",
+                   "polish_model": polish_model_name})
+        return
+    if polish_load_lock.locked():
+        return
     polish_ready = False
     polish_status = "loading"
     emit_json({"polish_available": False, "polish_status": "loading", "polish_model": "loading"})
@@ -720,6 +1133,8 @@ def stream_request_batch(batch_requests):
     if not batch_requests:
         emit_json({"results": []})
         return
+    with request_state_lock:
+        active_requests.update(value.get("id", 0) for value in batch_requests)
 
     cursor = 0
     while cursor < len(batch_requests):
@@ -738,29 +1153,20 @@ def stream_request_batch(batch_requests):
         try:
             translations = translate_text_batch(texts)
             response = []
-            immediate_polish = []
+            pending_polish = []
             for index, value in enumerate(group):
                 req_id = value.get("id", 0)
                 translated = translations[index] if index < len(translations) else ""
                 text_src = value.get("text", "")
                 response.append({"id": req_id, "translated": translated, "stage": "raw"})
 
-                # Queue for background polishing — non-blocking put, drop if full
-                if polish_ready:
-                    if is_polish_eligible(text_src, translated):
-                        try:
-                            polish_queue.put_nowait((req_id, text_src, translated))
-                        except queue.Full:
-                            # Queue full → emit as-is without polish
-                            immediate_polish.append({"id": req_id, "translated": translated, "stage": "polish"})
-                    else:
-                        immediate_polish.append({"id": req_id, "translated": translated, "stage": "polish"})
-                else:
-                    immediate_polish.append({"id": req_id, "translated": translated, "stage": "polish"})
-
+                context = str(value.get("context", ""))[-POLISH_CONTEXT_CHARS:]
+                pending_polish.append((req_id, text_src, translated, context) if context else
+                                      (req_id, text_src, translated))
+            # Strict raw-before-polish ordering, even on an immediate cache hit.
             emit_json({"results": response})
-            if immediate_polish:
-                emit_json({"results": immediate_polish})
+            for item in pending_polish:
+                enqueue_polish(*item)
         except Exception as exc:
             print(f"Translation failed: {exc}", file=sys.stderr, flush=True)
             failures = [
@@ -881,7 +1287,7 @@ def main():
         translate_text_batch(["Hello world"])   # Warm-up VinAI
 
     # ---- Emit ready IMMEDIATELY so Qt can start VinAI translations ----
-    # Arcee-VyLinh will load in background and send its own update when done.
+    # The selected refinement model sends its own update after background load.
     emit_json({
         "status": "ready",
         "available": is_ready,
@@ -900,21 +1306,11 @@ def main():
             continue
         try:
             request = json.loads(line)
+            if request.get("action") == "cancel":
+                cancel_request_ids(request.get("ids", []))
+                continue
             if request.get("action") == "clear_cache":
-                cache.clear()
-                while not polish_queue.empty():
-                    try:
-                        polish_queue.get_nowait()
-                        polish_queue.task_done()
-                    except Exception:
-                        break
-                if cache_db is not None:
-                    try:
-                        cache_db.execute("DELETE FROM translations")
-                        cache_db.execute("VACUUM")
-                        cache_db.commit()
-                    except Exception:
-                        pass
+                clear_translation_memory()
                 emit_json({"cache_cleared": True})
                 continue
 
@@ -926,6 +1322,7 @@ def main():
                     "polish_status": polish_status,
                     "polish_model": polish_model_name,
                     "queue_size": polish_queue.qsize() if polish_queue else 0,
+                    "polish_metrics": snapshot_polish_metrics(),
                 })
                 continue
 
@@ -936,45 +1333,16 @@ def main():
 
             if request.get("action") == "polish_batch":
                 items = request.get("items", [])
-                response_fallback = []
                 for it in items:
-                    req_id = it.get("id", 0)
-                    text_src = it.get("text", "")
-                    vi_raw = it.get("raw", "")
-                    if polish_ready and is_polish_eligible(text_src, vi_raw):
-                        try:
-                            polish_queue.put_nowait((req_id, text_src, vi_raw))
-                        except queue.Full:
-                            response_fallback.append({"id": req_id, "translated": vi_raw, "stage": "polish"})
-                    else:
-                        response_fallback.append({"id": req_id, "translated": vi_raw, "stage": "polish"})
-                if response_fallback:
-                    emit_json({"results": response_fallback})
+                    enqueue_polish(it.get("id", 0), it.get("text", ""), it.get("raw", ""),
+                                   str(it.get("context", ""))[-POLISH_CONTEXT_CHARS:])
                 continue
 
             batch_requests = request.get("batch")
             if batch_requests is not None:
                 stream_request_batch(batch_requests)
             else:
-                request_id = request.get("id", 0)
-                text = request.get("text", "")
-                try:
-                    res_list = translate_text_batch([text]) if text.strip() else [text]
-                    translated = res_list[0] if res_list else text
-                    emit_json({"results": [{"id": request_id, "translated": translated, "stage": "raw"}]})
-                    if polish_ready:
-                        if is_polish_eligible(text, translated):
-                            try:
-                                polish_queue.put_nowait((request_id, text, translated))
-                            except queue.Full:
-                                emit_json({"results": [{"id": request_id, "translated": translated, "stage": "polish"}]})
-                        else:
-                            emit_json({"results": [{"id": request_id, "translated": translated, "stage": "polish"}]})
-                    else:
-                        emit_json({"results": [{"id": request_id, "translated": translated, "stage": "polish"}]})
-                except Exception as exc:
-                    print(f"Translation failed: {exc}", file=sys.stderr, flush=True)
-                    emit_json({"failures": [{"id": request_id, "error": str(exc)}]})
+                stream_request_batch([request])
         except Exception as exc:
             print(f"Invalid translation request: {exc}", file=sys.stderr, flush=True)
             emit_json({"error": str(exc)})

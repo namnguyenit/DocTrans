@@ -22,6 +22,7 @@
 #include <QPageSize>
 #include <QPdfWriter>
 #include <QProgressDialog>
+#include <QSaveFile>
 
 namespace {
 QString buttonStyle(const QString &color) {
@@ -44,6 +45,7 @@ QString navigationStyle() {
 SplitViewReader::SplitViewReader(OfflineTranslator *translator, QWidget *parent)
     : QWidget(parent), m_translator(translator)
 {
+    if (m_translator) m_clientId = m_translator->registerClient();
     auto *root = new QVBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(0);
@@ -252,10 +254,30 @@ SplitViewReader::SplitViewReader(OfflineTranslator *translator, QWidget *parent)
             this, &SplitViewReader::renderCurrentPage);
 }
 
-SplitViewReader::~SplitViewReader() = default;
+SplitViewReader::~SplitViewReader() {
+    if (m_translator) m_translator->cancelClient(m_clientId);
+}
+
+void SplitViewReader::setForeground(bool foreground) {
+    const bool changed = m_foreground != foreground;
+    m_foreground = foreground;
+    if (foreground && changed && !m_currentDoc.filePath.isEmpty()) showPage(m_visiblePage);
+    if (!foreground) m_renderTimer.stop();
+}
+
+bool SplitViewReader::isTranslationComplete() const {
+    return !m_currentDoc.filePath.isEmpty() && !m_cancelled && m_failedUnits.isEmpty()
+        && m_results.size() == m_units.size() && m_polishedUnits.size() == m_units.size();
+}
 
 void SplitViewReader::onNmtReady() {
+    if (m_cancelled) return;
     if (m_translator && m_translator->isNmtReady() && !m_units.isEmpty()) {
+        for (int index : m_failedUnits) {
+            m_results.remove(index);
+            m_polishedUnits.remove(index);
+        }
+        m_failedUnits.clear();
         queueAllPages(m_visiblePage);
         renderCurrentPage();
         updateProgressLabel();
@@ -275,16 +297,7 @@ void SplitViewReader::onPolishModelReady() {
     // Background polish model finished loading — update status label
     if (m_translator && m_translator->isPolishAvailable()) {
         qDebug() << "Polish model online:" << m_translator->polishModelName();
-        // Automatically submit any unpolished raw translations to Model 2
-        if (!m_cancelled) {
-            for (int i = 0; i < m_units.size(); ++i) {
-                if (m_results.contains(i) && !m_polishedUnits.contains(i)) {
-                    const int reqId = m_nextRequestId++;
-                    m_requestToUnit.insert(reqId, i);
-                    m_translator->requestPolishOnlyAsync(reqId, m_units.value(i), m_results.value(i));
-                }
-            }
-        }
+        // The daemon retains raw results while the polish model is loading.
         updateProgressLabel();
     }
 }
@@ -296,7 +309,7 @@ void SplitViewReader::onModelStatusChanged() {
 void SplitViewReader::loadDocument(const DocumentContent &doc) {
     m_currentDoc = doc;
     m_renderTimer.stop();
-    if (m_translator) m_translator->cancelQueuedTranslations();
+    if (m_translator) m_translator->cancelClient(m_clientId);
 
     m_requestToUnit.clear();
     m_results.clear();
@@ -348,16 +361,14 @@ void SplitViewReader::buildPagesAndUnits(const DocumentContent &doc) {
                 if (blk.isWatermark || blk.text.trimmed().isEmpty()) {
                     continue;
                 }
-                const int unitIdx = m_units.size();
-                m_units.append(blk.text.trimmed());
-                m_unitPages.append(pageNum);
                 ElementKind kind = blk.isHeading ? ElementKind::Heading : ElementKind::Paragraph;
-                m_unitKinds.append(kind);
-                m_blockToUnit.insert({pIdx, bIdx}, unitIdx);
+                // Keep bounded model inputs without changing the PDF block's box.
+                const auto units = appendTextGroup(blk.text, pageNum, kind);
+                m_blockToUnit.insert({pIdx, bIdx}, units);
 
                 PageElement element;
                 element.kind = kind;
-                element.groups.append(QList<int>{unitIdx});
+                element.groups.append(units);
                 elements.append(element);
             }
         }
@@ -590,8 +601,13 @@ QStringList SplitViewReader::splitOversizedBlock(const QString &block) const {
 
 void SplitViewReader::showPage(int page) {
     m_visiblePage = qBound(1, page, m_pageCount);
-    m_cancelled = false;
     m_pageClock.restart();
+    if (!m_foreground) {
+        const QSignalBlocker blocker(m_pageSpin);
+        m_pageSpin->setValue(m_visiblePage);
+        updateProgressLabel();
+        return;
+    }
 
     m_isSyncing = true;
     if (m_currentDoc.type == DocumentType::PDF) {
@@ -828,17 +844,18 @@ QImage SplitViewReader::generateTranslatedPageImage(int pageIndex, qreal scale) 
         }
         if (blk.bbox.width() <= 0 || blk.bbox.height() <= 0) continue;
 
-        int unitIdx = m_blockToUnit.value({pageLayoutIdx, bIdx}, -1);
-        QString text = (unitIdx >= 0 && m_results.contains(unitIdx))
-                       ? m_results.value(unitIdx)
-                       : blk.text;
+        const auto units = m_blockToUnit.value({pageLayoutIdx, bIdx});
+        QStringList fragments;
+        for (int unit : units)
+            fragments.append(m_results.value(unit, m_units.value(unit)));
+        QString text = units.isEmpty() ? blk.text : fragments.join(' ');
 
         // Clean any residual markdown markers
         while (text.startsWith("# ") || text.startsWith("## ") || text.startsWith("### ")) {
             int sp = text.indexOf(' ');
             text = text.mid(sp + 1).trimmed();
         }
-        text.replace("**", "").replace("__", "").replace("`", "");
+        text.replace("**", "").replace("`", "");
         text = text.trimmed();
         if (text.isEmpty()) continue;
 
@@ -1014,7 +1031,7 @@ void SplitViewReader::queuePagesAround(int page) {
     // Add any untranslated unit on this page that might not be in pending yet
     for (int idx = 0; idx < m_units.size(); ++idx) {
         if (m_unitPages.value(idx) == page && !m_results.contains(idx) &&
-            !m_failedUnits.contains(idx) && !promoted.contains(idx)) {
+            !m_failedUnits.contains(idx) && !m_queuedUnits.contains(idx) && !promoted.contains(idx)) {
             promoted.prepend(idx);
             m_queuedUnits.insert(idx);
         }
@@ -1056,17 +1073,27 @@ void SplitViewReader::requestMoreTranslations() {
             continue;
         }
 
-        const int reqId = m_nextRequestId++;
+        const int reqId = m_translator->allocateRequestId();
         m_requestToUnit.insert(reqId, unitIndex);
         ++m_inFlight;
         m_cancelBtn->setEnabled(true);
-        m_translator->requestAsyncTranslation(reqId, text);
+        m_translator->requestAsyncTranslation(reqId, text, m_clientId, translationContext(unitIndex));
     }
 
     if (m_inFlight == 0 && m_pendingUnits.isEmpty()) {
         m_cancelBtn->setEnabled(false);
     }
     updateProgressLabel();
+}
+
+QString SplitViewReader::translationContext(int unitIndex) const {
+    // Source neighbours from this document only; scheduling order is unrelated.
+    QStringList parts;
+    if (unitIndex > 0)
+        parts.append("Previous passage: " + m_units.value(unitIndex - 1).right(270));
+    if (unitIndex + 1 < m_units.size())
+        parts.append("Next passage: " + m_units.value(unitIndex + 1).left(270));
+    return parts.join('\n');
 }
 
 bool SplitViewReader::shouldKeepOriginal(const QString &text) const {
@@ -1077,19 +1104,24 @@ bool SplitViewReader::shouldKeepOriginal(const QString &text) const {
 }
 
 bool SplitViewReader::isCodeBlock(const QString &text) const {
-    return text.contains("void ") || text.contains("class ") || text.contains("#include")
-        || text.contains("public:") || text.contains("def ") || text.contains("import ");
+    static const QRegularExpression code(QStringLiteral("\\b(?:void|class|def|import)\\s|#include|public:"));
+    return text.contains(code);
 }
 
 bool SplitViewReader::isLikelyNonLinguistic(const QString &text) const {
-    if (text.size() <= 4 && text.contains(QRegularExpression("^[0-9\\W]+$"))) {
-        return true;
-    }
-    return false;
+    // Numeric tables and register addresses need no inference. Require an
+    // explicit 0x prefix for hexadecimal so words such as FACE still translate.
+    static const QRegularExpression literals(QStringLiteral(
+        "\\b0[xX][0-9A-Fa-f]+\\b|\\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\\b|"
+        "\\b(?=[A-Za-z0-9]*[0-9])[A-Za-z][A-Za-z0-9]+\\b"));
+    static const QRegularExpression letters(QStringLiteral("[\\p{L}\\p{M}]"));
+    QString remaining = text;
+    remaining.remove(literals);
+    return !remaining.contains(letters);
 }
 
 void SplitViewReader::onTranslationResultReady(int reqId, const QString &result) {
-    if (!m_requestToUnit.contains(reqId)) return;
+    if (m_cancelled || !m_requestToUnit.contains(reqId)) return;
     const int unitIndex = m_requestToUnit.value(reqId);
     if (m_queuedUnits.contains(unitIndex)) {
         --m_inFlight;
@@ -1106,8 +1138,8 @@ void SplitViewReader::onTranslationResultReady(int reqId, const QString &result)
 }
 
 void SplitViewReader::onTranslationPolishedReady(int reqId, const QString &result) {
-    if (!m_requestToUnit.contains(reqId)) return;
-    const int unitIndex = m_requestToUnit.value(reqId);
+    if (m_cancelled || !m_requestToUnit.contains(reqId)) return;
+    const int unitIndex = m_requestToUnit.take(reqId);
     m_results.insert(unitIndex, result);
     m_polishedUnits.insert(unitIndex);
 
@@ -1120,8 +1152,7 @@ void SplitViewReader::onTranslationPolishedReady(int reqId, const QString &resul
 void SplitViewReader::onTranslationFailed(int reqId, const QString &error) {
     if (!m_requestToUnit.contains(reqId)) return;
     const int unitIndex = m_requestToUnit.take(reqId);
-    --m_inFlight;
-    m_queuedUnits.remove(unitIndex);
+    if (m_queuedUnits.remove(unitIndex)) --m_inFlight;
     m_failedUnits.insert(unitIndex);
 
     m_results.insert(unitIndex, m_units.value(unitIndex));
@@ -1145,6 +1176,11 @@ void SplitViewReader::resumeOrRestartModels() {
 
     m_cancelled = false;
     m_cancelBtn->setEnabled(true);
+    for (int index : m_failedUnits) {
+        m_results.remove(index);
+        m_polishedUnits.remove(index);
+    }
+    m_failedUnits.clear();
 
     // 1. Restart models if stopped or crashed
     if (nmtCrashed) {
@@ -1157,6 +1193,11 @@ void SplitViewReader::resumeOrRestartModels() {
     int requeuedRaw = 0;
     int requeuedPolish = 0;
 
+    if (m_translator) m_translator->cancelClient(m_clientId);
+    m_requestToUnit.clear();
+    m_pendingUnits.clear();
+    m_queuedUnits.clear();
+    m_inFlight = 0;
     QList<int> pendingRawList;
     QList<int> pendingPolishList;
 
@@ -1184,15 +1225,16 @@ void SplitViewReader::resumeOrRestartModels() {
     for (int u : pendingRawList) {
         if (!m_pendingUnits.contains(u)) {
             m_pendingUnits.append(u);
+            m_queuedUnits.insert(u);
         }
     }
 
     // Direct polish for units that already have raw translations
     if (!pendingPolishList.isEmpty() && m_translator->isPolishAvailable()) {
         for (int u : pendingPolishList) {
-            const int reqId = m_nextRequestId++;
+            const int reqId = m_translator->allocateRequestId();
             m_requestToUnit.insert(reqId, u);
-            m_translator->requestPolishOnlyAsync(reqId, m_units.value(u), m_results.value(u));
+            m_translator->requestPolishOnlyAsync(reqId, m_units.value(u), m_results.value(u), m_clientId, translationContext(u));
         }
     }
 
@@ -1205,7 +1247,9 @@ void SplitViewReader::cancelTranslation() {
     m_cancelled = true;
     m_pendingUnits.clear();
     m_queuedUnits.clear();
-    if (m_translator) m_translator->cancelQueuedTranslations();
+    if (m_translator) m_translator->cancelClient(m_clientId);
+    m_requestToUnit.clear();
+    m_inFlight = 0;
     m_cancelBtn->setEnabled(false);
     updateProgressLabel();
 }
@@ -1218,6 +1262,7 @@ void SplitViewReader::clearCache() {
         return;
     }
     if (m_translator) {
+        m_translator->cancelClient(m_clientId);
         m_translator->clearCache();
     }
     m_results.clear();
@@ -1257,6 +1302,10 @@ QString SplitViewReader::renderGroup(const QVector<int> &group) const {
 }
 
 void SplitViewReader::updateProgressLabel() {
+    emit progressChanged(m_results.size(), m_polishedUnits.size(), m_units.size(), m_cancelled, m_failedUnits.size());
+    m_cancelBtn->setEnabled(!m_cancelled && m_polishedUnits.size() < m_units.size());
+    m_exportPdfBtn->setEnabled(isTranslationComplete());
+    if (!m_foreground) return;
     OfflineTranslator::ModelStatus nmtSt = m_translator ? m_translator->nmtStatus() : OfflineTranslator::ModelStatus::NotStarted;
     OfflineTranslator::ModelStatus polSt = m_translator ? m_translator->polishStatus() : OfflineTranslator::ModelStatus::NotStarted;
 
@@ -1278,7 +1327,8 @@ void SplitViewReader::updateProgressLabel() {
                 "border:1px solid #ef5350; border-radius:5px; padding:4px 10px; }"
                 "QPushButton:hover { background:#d32f2f; }"
             );
-        } else if (m_cancelled && (docRawDone < docTotal || docPolishedDone < docTotal)) {
+        } else if ((m_cancelled || !m_failedUnits.isEmpty()) &&
+                   (docRawDone < docTotal || docPolishedDone < docTotal || !m_failedUnits.isEmpty())) {
             m_restartBtn->setVisible(true);
             m_restartBtn->setText("▶ Tiếp tục dịch");
             m_restartBtn->setStyleSheet(
@@ -1322,37 +1372,42 @@ void SplitViewReader::updateProgressLabel() {
         }
     }
 
-    QString vyLinhBadge;
+    QString polishName = m_translator ? m_translator->polishModelName() : QString();
+    QString polishLabel = polishName.section(' ', 0, 0);
+    polishLabel.remove("Arcee-").remove("-Q6_K").remove("-Instruct-2507");
+    if (polishLabel.isEmpty() || polishLabel == "loading" || polishLabel == "none")
+        polishLabel = "Hiệu đính";
+    QString polishBadge;
     if (polishCrashed) {
-        vyLinhBadge = QString(
+        polishBadge = QString(
             "<span style='background:#450a0a; color:#f87171; border:1px solid #dc2626; "
             "padding:3px 8px; border-radius:5px; font-weight:700; font-size:11px;'>"
-            "❌ VyLinh: CRASH / DỪNG</span>"
+            "❌ Hiệu đính: CRASH / DỪNG</span>"
         );
     } else if (polSt == OfflineTranslator::ModelStatus::Loading) {
-        vyLinhBadge = QString(
+        polishBadge = QString(
             "<span style='background:#3b0764; color:#d8b4fe; border:1px solid #7e22ce; "
             "padding:3px 8px; border-radius:5px; font-weight:700; font-size:11px;'>"
-            "⏳ VyLinh: Đang tải...</span>"
+            "⏳ Hiệu đính: Đang tải...</span>"
         );
     } else if (!m_translator || !m_translator->isPolishAvailable()) {
-        vyLinhBadge = QString(
+        polishBadge = QString(
             "<span style='background:#27272a; color:#a1a1aa; border:1px solid #3f3f46; "
             "padding:3px 8px; border-radius:5px; font-weight:600; font-size:11px;'>"
-            "✨ VyLinh: Tắt</span>"
+            "✨ Hiệu đính: Tắt</span>"
         );
     } else if (docPolishedDone >= docTotal && docTotal > 0) {
-        vyLinhBadge = QString(
+        polishBadge = QString(
             "<span style='background:#064e3b; color:#34d399; border:1px solid #059669; "
             "padding:3px 8px; border-radius:5px; font-weight:700; font-size:11px;'>"
-            "✨ VyLinh Polish: 100% Hoàn tất</span>"
+            "✨ Hiệu đính: 100% Hoàn tất</span>"
         );
     } else {
         const int polishPercent = docTotal > 0 ? qMin(100, (docPolishedDone * 100 / docTotal)) : 100;
-        vyLinhBadge = QString(
+        polishBadge = QString(
             "<span style='background:#2e1065; color:#c084fc; border:1px solid #581c87; "
             "padding:3px 8px; border-radius:5px; font-weight:700; font-size:11px;'>"
-            "✨ VyLinh Polish: %1% (%2/%3) ⏳</span>"
+            "✨ Hiệu đính: %1% (%2/%3) ⏳</span>"
         ).arg(polishPercent).arg(docPolishedDone).arg(docTotal);
     }
 
@@ -1379,11 +1434,14 @@ void SplitViewReader::updateProgressLabel() {
         ).arg(m_visiblePage).arg(pagePolishedDone).arg(pageTotal);
     }
 
-    m_rightLabel->setText(QString("%1  %2  %3").arg(vinaiBadge, vyLinhBadge, statusSuffix));
+    polishBadge.replace("Hiệu đính", polishLabel.toHtmlEscaped());
+    m_rightLabel->setText(QString("%1  %2  %3").arg(vinaiBadge, polishBadge, statusSuffix));
+    m_rightLabel->setToolTip(polishName);
     m_rightLabel->setStyleSheet("background:transparent;");
 }
 
 void SplitViewReader::renderCurrentPage() {
+    if (!m_foreground) return;
     if (m_currentDoc.type == DocumentType::PDF) {
         m_rightStack->setCurrentWidget(m_rightPdfScroll);
         m_translatedPdfImage = generateTranslatedPageImage(m_visiblePage, 3.0);
@@ -1439,87 +1497,63 @@ void SplitViewReader::renderCurrentPage() {
     updateProgressLabel();
 }
 
-void SplitViewReader::exportTranslatedPdf() {
-    if (m_currentDoc.filePath.isEmpty() || m_pageCount <= 0) {
-        QMessageBox::warning(this, "Thông báo", "Không có tài liệu nào đang mở để xuất.");
-        return;
-    }
-
-    QString defaultName = QFileInfo(m_currentDoc.filePath).completeBaseName() + "_translated.pdf";
-    QString exportPath = QFileDialog::getSaveFileName(
-        this,
-        "Xuất Tài Liệu PDF Đã Dịch",
-        defaultName,
-        "Tệp PDF (*.pdf)"
-    );
-    if (exportPath.isEmpty()) return;
-
-    QProgressDialog progress("Đang xuất tài liệu PDF...", "Hủy", 0, m_pageCount, this);
-    progress.setWindowTitle("Xuất PDF Đã Dịch");
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(0);
-    progress.setValue(0);
-
-    QPdfWriter writer(exportPath);
-    writer.setResolution(300);
-
-    QPainter painter;
-    if (!painter.begin(&writer)) {
-        QMessageBox::critical(this, "Lỗi", "Không thể tạo tệp PDF tại đường dẫn đã chọn. Vui lòng kiểm tra quyền ghi tệp.");
-        return;
-    }
-
-    for (int page = 1; page <= m_pageCount; ++page) {
-        progress.setLabelText(QString("Đang xuất trang %1 / %2...").arg(page).arg(m_pageCount));
-        progress.setValue(page - 1);
-        QCoreApplication::processEvents();
-
-        if (progress.wasCanceled()) {
-            painter.end();
-            QFile::remove(exportPath);
-            return;
-        }
-
-        if (page > 1) {
-            writer.newPage();
-        }
-
-        if (m_currentDoc.type == DocumentType::PDF) {
-            if (page - 1 < m_currentDoc.pageLayouts.size()) {
-                const PageLayoutData &layout = m_currentDoc.pageLayouts[page - 1];
-                if (layout.width > 0 && layout.height > 0) {
-                    QPageSize pageSize(QSizeF(layout.width, layout.height), QPageSize::Point);
-                    writer.setPageSize(pageSize);
-                    writer.setPageMargins(QMarginsF(0, 0, 0, 0));
-                }
-            }
-            QImage pageImg = generateTranslatedPageImage(page, 3.0);
-            if (!pageImg.isNull()) {
-                QRect targetRect = writer.pageLayout().paintRectPixels(writer.resolution());
-                painter.drawImage(targetRect, pageImg);
-            }
-        } else {
+bool SplitViewReader::exportToPdf(const QString &path, QString *error) {
+    auto fail = [error](const QString &message) { if (error) *error = message; return false; };
+    if (m_currentDoc.filePath.isEmpty()) return fail("Chưa mở tài liệu");
+    if (!isTranslationComplete()) return fail("Tài liệu chưa dịch xong; hãy tiếp tục hoặc xử lý phần bị lỗi");
+    QSaveFile output(path);
+    if (!output.open(QIODevice::WriteOnly)) return fail(output.errorString());
+    const bool written = [&]() {
+        QPdfWriter writer(&output);
+        writer.setResolution(300);
+        writer.setTitle(QFileInfo(m_currentDoc.filePath).completeBaseName() + " — Bản dịch");
+        if (m_currentDoc.type != DocumentType::PDF) {
             writer.setPageSize(QPageSize(QPageSize::A4));
             writer.setPageMargins(QMarginsF(15, 15, 15, 15), QPageLayout::Millimeter);
-            QString pageTxt = m_pageTexts.value(page - 1);
-            QRect targetRect = writer.pageLayout().paintRectPixels(writer.resolution());
-            QFont printFont("Segoe UI", 11);
-            painter.setFont(printFont);
-            painter.setPen(Qt::black);
-            painter.drawText(targetRect, Qt::TextWordWrap, pageTxt);
+            QStringList translated;
+            for (int i = 0; i < m_units.size(); ++i) translated.append(m_results.value(i, m_units.value(i)));
+            QTextDocument text;
+            text.setDefaultFont(QFont("Segoe UI", 11));
+            text.setPlainText(translated.join("\n\n"));
+            text.print(&writer);
+            return true;
         }
+        QPainter painter;
+        for (int page = 1; page <= m_pageCount; ++page) {
+            if (page - 1 < m_currentDoc.pageLayouts.size()) {
+                const auto &layout = m_currentDoc.pageLayouts[page - 1];
+                writer.setPageSize(QPageSize(QSizeF(layout.width, layout.height), QPageSize::Point));
+            }
+            writer.setPageMargins(QMarginsF(0, 0, 0, 0));
+            if (page == 1) {
+                if (!painter.begin(&writer)) return fail("Không tạo được PDF tại vị trí đã chọn");
+            } else if (!writer.newPage()) {
+                painter.end();
+                return fail("Không ghi được trang PDF");
+            }
+            const QImage image = generateTranslatedPageImage(page, 3.0);
+            if (image.isNull()) {
+                painter.end();
+                return fail(QString("Không dựng được trang %1").arg(page));
+            }
+            painter.drawImage(writer.pageLayout().paintRectPixels(writer.resolution()), image);
+        }
+        return painter.end() ? true : fail("Không hoàn tất được PDF");
+    }();
+    if (!written) return false;
+    return output.commit() ? true : fail(output.errorString());
+}
+void SplitViewReader::exportTranslatedPdf() {
+    if (!isTranslationComplete()) {
+        QMessageBox::information(this, "Chưa thể xuất", "Hãy đợi tài liệu dịch xong hoặc tiếp tục các phần còn lại trước khi xuất.");
+        return;
     }
-
-    painter.end();
-    progress.setValue(m_pageCount);
-
-    auto reply = QMessageBox::question(
-        this,
-        "Xuất Thành Công",
-        "Đã xuất tài liệu PDF đã dịch thành công!\nĐường dẫn: " + exportPath + "\n\nBạn có muốn mở tệp ngay không?",
-        QMessageBox::Yes | QMessageBox::No
-    );
-    if (reply == QMessageBox::Yes) {
-        QDesktopServices::openUrl(QUrl::fromLocalFile(exportPath));
-    }
+    const QString path = QFileDialog::getSaveFileName(this, "Xuất bản dịch",
+        QFileInfo(m_currentDoc.filePath).completeBaseName() + "_translated.pdf", "PDF (*.pdf)");
+    if (path.isEmpty()) return;
+    QString error;
+    if (!exportToPdf(path, &error)) { QMessageBox::warning(this, "Không xuất được PDF", error); return; }
+    if (QMessageBox::question(this, "Đã xuất bản dịch", "Đã lưu:\n" + path + "\n\nMở bản dịch ngay?",
+        QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes)
+        QDesktopServices::openUrl(QUrl::fromLocalFile(path));
 }

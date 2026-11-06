@@ -90,9 +90,23 @@ OfflineTranslator::OfflineTranslator(QObject *parent)
     
     m_batchTimer.setSingleShot(true);
     connect(&m_batchTimer, &QTimer::timeout, this, &OfflineTranslator::flushTranslationQueue);
+    connect(this, &OfflineTranslator::translationPolishedReady, this, [this](int id, const QString &) {
+        m_scheduler.finish(id);
+        if (m_scheduler.queuedCount() > 0) m_batchTimer.start(0);
+    });
+    connect(this, &OfflineTranslator::translationFailed, this, [this](int id, const QString &) {
+        m_scheduler.finish(id);
+        if (m_scheduler.queuedCount() > 0) m_batchTimer.start(0);
+    });
+    connect(this, &OfflineTranslator::nmtProcessFailed, this, &OfflineTranslator::failPendingRequests);
+    connect(this, &OfflineTranslator::nmtReady, this, [this]() { m_batchTimer.start(0); });
 }
 
 OfflineTranslator::~OfflineTranslator() {
+    // Intentional teardown must not re-enter readers or partially destroyed UI.
+    m_batchTimer.stop();
+    blockSignals(true);
+    if (m_nmtProcess) m_nmtProcess->disconnect(this);
     if (m_nmtProcess && m_nmtProcess->state() != QProcess::NotRunning) {
         m_nmtProcess->kill();
         m_nmtProcess->waitForFinished(1000);
@@ -100,6 +114,7 @@ OfflineTranslator::~OfflineTranslator() {
 }
 
 void OfflineTranslator::initNmtDaemon() {
+    m_modelDiagnostics = {};
     m_nmtStatus = ModelStatus::Loading;
     m_polishStatus = ModelStatus::Loading;
     m_nmtReady = false;
@@ -130,10 +145,7 @@ void OfflineTranslator::initNmtDaemon() {
         if (searchDir.exists("models")) {
             const QString modelsDir = searchDir.absoluteFilePath("models");
             env.insert("READDOC_MODELS_DIR", modelsDir);
-            const QString polishFile = QDir(modelsDir).filePath("polish/Arcee-VyLinh.Q6_K.gguf");
-            if (QFileInfo::exists(polishFile)) {
-                env.insert("READDOC_POLISH_MODEL", polishFile);
-            }
+            // The daemon selects a local model; retain an explicit user override.
             const QString vinaiDir = QDir(modelsDir).filePath("vinai-translate-en2vi");
             if (QFileInfo::exists(QDir(vinaiDir).filePath("config.json"))) {
                 env.insert("READDOC_NMT_MODEL", vinaiDir);
@@ -194,6 +206,8 @@ void OfflineTranslator::initNmtDaemon() {
 
 void OfflineTranslator::restartDaemon() {
     qDebug() << "Restarting OfflineTranslator daemon...";
+    m_nmtReady = false;
+    m_nmtInitialized = false;
     cancelQueuedTranslations();
     if (m_nmtProcess) {
         m_nmtProcess->disconnect(this);
@@ -229,21 +243,13 @@ void OfflineTranslator::restartPolishModel() {
     m_nmtProcess->write(QJsonDocument(req).toJson(QJsonDocument::Compact) + "\n");
 }
 
-void OfflineTranslator::requestPolishOnlyAsync(int reqId, const QString &sourceEn, const QString &rawVi) {
-    if (!m_nmtProcess || m_nmtProcess->state() != QProcess::Running || !m_polishAvailable) {
+void OfflineTranslator::requestPolishOnlyAsync(int reqId, const QString &sourceEn, const QString &rawVi, int client, const QString &context) {
+    if (!m_nmtProcess || m_nmtProcess->state() != QProcess::Running) {
         emit translationPolishedReady(reqId, rawVi);
         return;
     }
-    QJsonObject req;
-    req["action"] = "polish_batch";
-    QJsonArray items;
-    QJsonObject item;
-    item["id"] = reqId;
-    item["text"] = sourceEn;
-    item["raw"] = rawVi;
-    items.append(item);
-    req["items"] = items;
-    m_nmtProcess->write(QJsonDocument(req).toJson(QJsonDocument::Compact) + "\n");
+    m_scheduler.enqueue({reqId, client, sourceEn, rawVi, true, context});
+    if (!m_batchTimer.isActive()) m_batchTimer.start(5);
 }
 
 void OfflineTranslator::onNmtOutputReady() {
@@ -298,9 +304,12 @@ void OfflineTranslator::onNmtOutputReady() {
                         qWarning() << "Polish model crashed/failed:" << m_polishError;
                     } else if (pStatus == "loading") {
                         m_polishStatus = ModelStatus::Loading;
+                    } else {
+                        m_polishStatus = ModelStatus::Stopped;
                     }
                     emit modelStatusChanged();
                 } else if (doc.object().contains("action") && doc.object().value("action").toString() == "status_response") {
+                    m_modelDiagnostics = doc.object();
                     m_nmtReady = doc.object().value("nmt_ready").toBool();
                     m_nmtStatus = m_nmtReady ? ModelStatus::Ready : ModelStatus::Crashed;
                     m_polishAvailable = doc.object().value("polish_ready").toBool();
@@ -352,106 +361,87 @@ void OfflineTranslator::onNmtOutputReady() {
     }
 }
 
-void OfflineTranslator::queryNmtModelAsync(int reqId, const QString &text) {
-
-    if (!m_nmtReady || !m_nmtProcess || m_nmtProcess->state() != QProcess::Running) {
-        emit translationResultReady(reqId, text);
-        return;
-    }
-
-    m_translationQueue.append(qMakePair(reqId, text));
-    if (m_translationQueue.size() >= kPreferredBatchSize) {
-        flushTranslationQueue();
-    } else {
-        if (!m_batchTimer.isActive()) {
-            m_batchTimer.start(5);
-        }
-    }
-}
-
 void OfflineTranslator::cancelQueuedTranslations() {
     m_batchTimer.stop();
-    m_translationQueue.clear();
+    failPendingRequests("Đã khởi động lại bộ dịch");
+}
+
+void OfflineTranslator::failPendingRequests(const QString &error) {
+    const QList<int> ids = m_scheduler.abortAll();
+    for (int id : ids) emit translationFailed(id, error);
+}
+
+void OfflineTranslator::cancelClient(int client) {
+    const QList<int> ids = m_scheduler.cancelClient(client);
+    if (!ids.isEmpty() && m_nmtProcess && m_nmtProcess->state() == QProcess::Running) {
+        QJsonArray values;
+        for (int id : ids) values.append(id);
+        QJsonObject request;
+        request["action"] = "cancel";
+        request["ids"] = values;
+        m_nmtProcess->write(QJsonDocument(request).toJson(QJsonDocument::Compact) + "\n");
+    }
 }
 
 void OfflineTranslator::clearCache() {
-    cancelQueuedTranslations();
     if (m_nmtProcess && m_nmtProcess->state() == QProcess::Running) {
         QJsonObject req;
         req["action"] = "clear_cache";
         QByteArray payload = QJsonDocument(req).toJson(QJsonDocument::Compact) + "\n";
         m_nmtProcess->write(payload);
     }
-    const QStringList paths = {
-        QDir::home().filePath(".local/share/readDoc/translation_memory.sqlite3"),
-        QDir::home().filePath(".local/share/readDoc/translation_memory.sqlite3-wal"),
-        QDir::home().filePath(".local/share/readDoc/translation_memory.sqlite3-shm"),
-        QDir::home().filePath("AppData/Roaming/readDoc/translation_memory.sqlite3"),
-        QDir::home().filePath("AppData/Roaming/readDoc/translation_memory.sqlite3-wal"),
-        QDir::home().filePath("AppData/Roaming/readDoc/translation_memory.sqlite3-shm")
-    };
-    for (const QString &p : paths) {
-        if (QFile::exists(p)) {
-            QFile::remove(p);
-        }
-    }
+}
+
+void OfflineTranslator::requestModelDiagnostics() {
+    if (m_nmtProcess && m_nmtProcess->state() == QProcess::Running)
+        m_nmtProcess->write("{\"action\":\"status\"}\n");
 }
 
 void OfflineTranslator::flushTranslationQueue() {
-    if (m_translationQueue.isEmpty()) return;
+    if (m_scheduler.queuedCount() == 0) return;
     if (!m_nmtReady || !m_nmtProcess || m_nmtProcess->state() != QProcess::Running) {
-        for (const auto &item : m_translationQueue) {
-            emit translationFailed(item.first, "Model local không chạy");
-        }
-        m_translationQueue.clear();
+        if (m_nmtInitialized) failPendingRequests("Model local không chạy");
         return;
     }
-
-    QJsonObject req;
-    QJsonArray batchArr;
-    for (const auto &item : m_translationQueue) {
+    const auto batch = m_scheduler.takeBatch(kPreferredBatchSize);
+    QJsonArray batchArr, polishArr;
+    for (const auto &item : batch) {
         QJsonObject batchItem;
-        batchItem["id"] = item.first;
-        batchItem["text"] = item.second;
-        batchArr.append(batchItem);
+        batchItem["id"] = item.id;
+        batchItem["text"] = item.text;
+        batchItem["context"] = item.context;
+        if (item.polishOnly) {
+            batchItem["raw"] = item.raw;
+            polishArr.append(batchItem);
+        } else batchArr.append(batchItem);
     }
-    req["batch"] = batchArr;
-    
-    QByteArray payload = QJsonDocument(req).toJson(QJsonDocument::Compact) + "\n";
-    m_nmtProcess->write(payload);
-    
-    m_translationQueue.clear();
+    if (!batchArr.isEmpty()) {
+        QJsonObject req;
+        req["batch"] = batchArr;
+        m_nmtProcess->write(QJsonDocument(req).toJson(QJsonDocument::Compact) + "\n");
+    }
+    if (!polishArr.isEmpty()) {
+        QJsonObject req;
+        req["action"] = "polish_batch";
+        req["items"] = polishArr;
+        m_nmtProcess->write(QJsonDocument(req).toJson(QJsonDocument::Compact) + "\n");
+    }
+    if (!batch.isEmpty() && m_scheduler.queuedCount() > 0) m_batchTimer.start(0);
 }
 
 QString OfflineTranslator::postProcessTranslation(const QString &raw) {
-    if (raw.isEmpty()) return "";
-    QString text = raw;
-
-    text.replace(QRegularExpression("\\s+"), " ");
-    text.replace(QRegularExpression("\\s+([.,!?:;])"), "\\1");
-    text.replace(" / ", " ");
-    text.replace(" /", "");
-    text.replace("/ ", "");
-
-    text = text.trimmed();
-    if (!text.isEmpty() && text[0].isLower()) {
-        text[0] = text[0].toUpper();
-    }
-
-    return text;
+    // Keep validated operators, identifier case and spacing inside code intact.
+    return raw.trimmed();
 }
 
-void OfflineTranslator::requestAsyncTranslation(int reqId, const QString &sentence) {
+void OfflineTranslator::requestAsyncTranslation(int reqId, const QString &sentence, int client, const QString &context) {
     QString trimmed = sentence.trimmed();
     if (trimmed.isEmpty()) {
         emit translationResultReady(reqId, "");
+        emit translationPolishedReady(reqId, "");
         return;
     }
 
-    if (m_nmtReady) {
-        queryNmtModelAsync(reqId, trimmed);
-        return;
-    }
-
-    emit translationResultReady(reqId, trimmed);
+    m_scheduler.enqueue({reqId, client, trimmed, {}, false, context});
+    if (!m_batchTimer.isActive()) m_batchTimer.start(5);
 }

@@ -29,6 +29,7 @@ Makefile
 
 # Large model weights (use download_model.py to fetch)
 models/
+tools/llama-cpp/
 model/
 *.gguf
 *.safetensors

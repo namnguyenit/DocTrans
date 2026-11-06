@@ -13,26 +13,28 @@ int main(int argc, char *argv[]) {
 
     const QStringList arguments = QCoreApplication::arguments();
     const bool bilingual = arguments.contains("--bilingual");
+    const bool batch = arguments.contains("--batch");
     int initialPage = 1;
     const int pageOption = arguments.indexOf("--page");
     if (pageOption >= 0 && pageOption + 1 < arguments.size()) {
         initialPage = qMax(1, arguments[pageOption + 1].toInt());
     }
-    QString documentPath;
+    QStringList documentPaths;
     for (int index = 1; index < arguments.size(); ++index) {
         if (arguments[index] == "--bilingual") continue;
+        if (arguments[index] == "--batch") continue;
         if (arguments[index] == "--page") {
             ++index;
             continue;
         }
         if (QFileInfo::exists(arguments[index])) {
-            documentPath = QFileInfo(arguments[index]).absoluteFilePath();
-            break;
+            documentPaths.append(QFileInfo(arguments[index]).absoluteFilePath());
         }
     }
-    if (!documentPath.isEmpty()) {
-        QTimer::singleShot(0, &window, [&window, documentPath, bilingual, initialPage]() {
-            window.openDocument(documentPath, bilingual, initialPage);
+    if (!documentPaths.isEmpty()) {
+        QTimer::singleShot(0, &window, [&window, documentPaths, bilingual, batch, initialPage]() {
+            if (documentPaths.size() > 1 || batch) window.openDocuments(documentPaths, true);
+            else window.openDocument(documentPaths.first(), bilingual, initialPage);
         });
     }
     return app.exec();

@@ -15,6 +15,7 @@
 #include <QTimer>
 #include <QVector>
 #include <QWidget>
+#include <QPointer>
 
 #include "readDoc/Data/DocumentParser.h"
 #include "readDoc/System/OfflineTranslator.h"
@@ -27,6 +28,13 @@ public:
 
     void loadDocument(const DocumentContent &doc);
     void goToPage(int page);
+    void setForeground(bool foreground);
+    void stopTranslation() { cancelTranslation(); }
+    bool isTranslationComplete() const;
+    bool exportToPdf(const QString &path, QString *error = nullptr);
+
+signals:
+    void progressChanged(int rawDone, int polishedDone, int total, bool paused, int failed);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -49,6 +57,7 @@ private slots:
     void onModelStatusChanged();
 
 private:
+    QString translationContext(int unitIndex) const;
     QSplitter         *m_splitter = nullptr;
     QStackedWidget    *m_leftStack = nullptr;
     QStackedWidget    *m_rightStack = nullptr;
@@ -59,7 +68,9 @@ private:
     QTextBrowser      *m_leftBrowser = nullptr;
     QTextBrowser      *m_rightBrowser = nullptr;
     
-    OfflineTranslator *m_translator = nullptr;
+    QPointer<OfflineTranslator> m_translator;
+    int m_clientId = 0;
+    bool m_foreground = true;
     DocumentContent    m_currentDoc;
 
     QWidget     *m_headerBar = nullptr;
@@ -104,12 +115,11 @@ private:
     QHash<int, QString> m_results;
     QSet<int> m_failedUnits;
     QSet<int> m_polishedUnits;
-    QMap<QPair<int, int>, int> m_blockToUnit;
+    QMap<QPair<int, int>, QVector<int>> m_blockToUnit;
 
     QList<int> m_pendingUnits;
     QSet<int> m_queuedUnits;
     QHash<int, int> m_requestToUnit;
-    int m_nextRequestId = 1;
     int m_inFlight = 0;
     int m_received = 0;
 
